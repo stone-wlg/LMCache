@@ -49,38 +49,64 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         Input:
             config: the lmcache engine config
             metadata: the lmcache engine metadata
+
+        NOTE on lazy shape properties
+        ──────────────────────────────
+        `meta_shapes`, `meta_dtypes`, `full_chunk_size_bytes`, and
+        `single_token_size` are **properties** that delegate to
+        `metadata.get_shapes()` / `metadata.get_dtypes()` on every access.
+
+        This is intentional.  The `kv_layer_groups_manager` inside
+        `LMCacheMetadata` is populated *after* the connector is constructed
+        (via `register_kv_caches()` → `_build_kv_layer_groups()`).  If we
+        cached the shapes at `__init__` time we would capture the empty
+        fallback (a single legacy group) and later allocate MemoryObjs with
+        the wrong shape/dtype for multi-group MLA models (e.g. GLM-5 has
+        two groups: K_rope/uint8 and Latent KV/bfloat16).  Reading the file
+        into that wrongly-sized buffer produces garbled output on every
+        cache-hit after a vLLM restart.
         """
         # TODO(chunxiaozheng): support layerwise here
         assert metadata is not None
+        # Keep a reference so the lazy properties can call get_shapes() /
+        # get_dtypes() after kv_layer_groups_manager is populated.
+        self._connector_metadata = metadata
         self.save_chunk_meta: bool = (
             config.extra_config is None
             or config.extra_config.get("save_chunk_meta", True)
             or config.use_layerwise
         )
-        self.meta_shapes: list[torch.Size] = metadata.get_shapes()
-        self.meta_dtypes: list[torch.dtype] = metadata.get_dtypes()
         self.meta_fmt: MemoryFormat = (
             MemoryFormat.KV_MLA_FMT if metadata.use_mla else MemoryFormat.KV_2LTD
         )
-        self.full_chunk_size_bytes: int = get_size_bytes(
-            self.meta_shapes, self.meta_dtypes
-        )
-        assert self.full_chunk_size_bytes % metadata.chunk_size == 0
-        self.single_token_size = self.full_chunk_size_bytes // metadata.chunk_size
 
         # init remote metadata info
         init_remote_metadata_info(metadata.get_num_groups())
         self.remote_metadata_bytes = get_remote_metadata_bytes()
         logger.info(
-            "init remote connector metadata info, shapes: %s, dtypes: %s, fmt: %s, "
-            "full chunk size: %s, single token size: %s, remote metadata bytes: %s",
-            self.meta_shapes,
-            self.meta_dtypes,
+            "init remote connector metadata info, "
+            "fmt: %s, remote metadata bytes: %s "
+            "(shapes/dtypes/sizes are lazy — will be correct after "
+            "kv_layer_groups_manager is built)",
             self.meta_fmt,
-            self.full_chunk_size_bytes,
-            self.single_token_size,
             self.remote_metadata_bytes,
         )
+
+    @property
+    def meta_shapes(self) -> list:
+        return self._connector_metadata.get_shapes()
+
+    @property
+    def meta_dtypes(self) -> list:
+        return self._connector_metadata.get_dtypes()
+
+    @property
+    def full_chunk_size_bytes(self) -> int:
+        return get_size_bytes(self.meta_shapes, self.meta_dtypes)
+
+    @property
+    def single_token_size(self) -> int:
+        return self.full_chunk_size_bytes // self._connector_metadata.chunk_size
 
     @NotAudit
     def reshape_partial_chunk(
