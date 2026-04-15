@@ -70,10 +70,23 @@ class RemoteBackend(StorageBackendInterface):
             config.remote_serde, metadata, config
         )
 
-        # Precompute MLA mode status
+        # Precompute MLA mode status.
+        # `remote_enable_mla_worker_id_as0` controls whether non-zero workers
+        # defer all remote I/O to worker 0 (reads with worker_id=0, skips writes).
+        # This is the correct behaviour when save_only_first_rank=True: only
+        # worker 0 stores KV and broadcasts it to TP peers via NCCL.
+        # When save_only_first_rank=False every worker must independently
+        # cache its own KV shard, so the mode must be disabled.
+        # We therefore default remote_enable_mla_worker_id_as0 to
+        # save_only_first_rank (not to use_mla) so that setting
+        # save_only_first_rank=False automatically disables this mode without
+        # requiring an extra explicit flag.
+        _save_only_first_rank = config.get_extra_config_value(
+            "save_only_first_rank", metadata.use_mla
+        )
         self._mla_worker_id_as0_mode = (
             config.get_extra_config_value(
-                "remote_enable_mla_worker_id_as0", metadata.use_mla
+                "remote_enable_mla_worker_id_as0", _save_only_first_rank
             )
             and metadata.use_mla
             and metadata.world_size > 1
