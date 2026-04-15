@@ -156,6 +156,10 @@ class VllmServiceFactory(BaseServiceFactory):
             chunk_size=self.lmcache_config.chunk_size,
             engine_id=engine_id,
             kv_connector_extra_config=kv_connector_extra_config,
+            # Provide tp_size so is_first_rank() can use a PP-stage-aware
+            # check (worker_id % tp_size == 0) rather than global rank == 0.
+            # This enables correct save_only_first_rank behaviour with PP>1.
+            tp_size=parallel_config.tensor_parallel_size,
         )
         return self.metadata
 

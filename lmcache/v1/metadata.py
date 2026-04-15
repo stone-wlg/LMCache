@@ -64,9 +64,30 @@ class LMCacheMetadata:
     engine_id: Optional[str] = None
     """ extra config from kv_connector (e.g., lmcache_rpc_port) """
     kv_connector_extra_config: Optional[dict] = None
+    """Tensor-parallel size.  When > 1, is_first_rank() uses a
+    PP-stage-aware check (worker_id % tp_size == 0) so that each
+    pipeline-parallel stage has its own independent "first rank" that
+    stores KV cache and broadcasts to its TP peers.  Defaults to 1
+    (legacy single-rank-zero behaviour) to preserve backward compat."""
+    tp_size: int = 1
 
     def is_first_rank(self) -> bool:
-        """Check if the current worker is the first rank"""
+        """Check if this worker is the first (TP-rank-0) within its PP stage.
+
+        When tp_size > 1 (set explicitly by the integration):
+          - Returns True for all workers whose global rank is a multiple of
+            tp_size, i.e. tp_rank == 0 within each PP stage.
+          - This enables each PP stage to independently store its KV cache
+            and broadcast to its TP peers (via the TP-group broadcast_fn).
+          - Works correctly for PP=1 (only global rank 0) and PP>1 (one
+            "first rank" per PP stage).
+
+        When tp_size == 1 (default / not explicitly provided):
+          - Falls back to the legacy check (worker_id == first_rank == 0)
+            for full backward compatibility.
+        """
+        if self.tp_size > 1:
+            return self.worker_id % self.tp_size == 0
         return self.worker_id == self.first_rank
 
     # TODO(chunxiaozheng): some uts do not `build_kv_layer_groups`

@@ -1751,7 +1751,12 @@ class LMCacheEngine:
                 # Broadcast tensor data
                 raw_tensor = memory_obj.raw_tensor
                 assert raw_tensor is not None
-                tensor_to_broadcast = raw_tensor.to(f"cuda:{self.metadata.worker_id}")
+                # Use local_worker_id (= TP-rank within this node) as the
+                # CUDA device index so that PP-stage non-zero first-ranks
+                # (whose global worker_id may exceed cuda device count) place
+                # the tensor on the correct local GPU before broadcasting.
+                local_cuda_idx = self.metadata.local_worker_id
+                tensor_to_broadcast = raw_tensor.to(f"cuda:{local_cuda_idx}")
                 self.broadcast_fn(tensor_to_broadcast, self.metadata.first_rank)
         else:
             # Receive total chunk count

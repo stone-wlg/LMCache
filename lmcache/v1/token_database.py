@@ -208,12 +208,25 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         self, chunk_hash: int, request_configs: Optional[dict] = None
     ):
         assert self.metadata is not None
-        # When save_only_first_rank is enabled (for MLA), we deliberately
-        # collapse the CacheEngineKey.world_size to 1 so that cache keys
-        # become world-size agnostic across compatible deployments.
+        if self.save_only_first_rank:
+            # Collapse world_size to 1 so keys are world-size-agnostic across
+            # compatible deployments.
+            # Use pp_rank (= worker_id // tp_size) as the worker_id so that
+            # each PP stage gets a unique, stable key regardless of TP size.
+            # For tp_size == 1 (legacy) this reduces to worker_id unchanged.
+            tp_size = max(self.metadata.tp_size, 1)
+            kv_worker_id = self.metadata.worker_id // tp_size  # == pp_rank
+            return CacheEngineKey(
+                self.metadata.model_name,
+                1,
+                kv_worker_id,
+                chunk_hash,
+                self.metadata.kv_dtype,
+                request_configs,
+            )
         return CacheEngineKey(
             self.metadata.model_name,
-            self.metadata.world_size if not self.save_only_first_rank else 1,
+            self.metadata.world_size,
             self.metadata.worker_id,
             chunk_hash,
             self.metadata.kv_dtype,
