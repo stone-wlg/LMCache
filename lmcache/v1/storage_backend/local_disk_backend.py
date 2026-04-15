@@ -497,19 +497,42 @@ class LocalDiskBackend(StorageBackendInterface):
             dtype = self.dict[key].dtype
             shape = self.dict[key].shape
             fmt = self.dict[key].fmt
+            # MLA fix: read multi-group shapes/dtypes if stored (same as get_blocking).
+            # Without this, the prefetch path allocates a single-group CPU buffer for
+            # multi-group MLA chunks, producing a MemoryObj whose metadata.shapes is
+            # None.  When to_gpu() is later called on that object it skips the
+            # multi-group transfer path and transfers raw bytes using the wrong layout,
+            # corrupting the GPU KV cache and causing garbled model output.
+            multi_shapes = getattr(self.dict[key], "_shapes", None)
+            multi_dtypes = getattr(self.dict[key], "_dtypes", None)
 
-            assert dtype is not None
-            assert shape is not None
+            is_multi_group = (
+                multi_shapes is not None
+                and multi_dtypes is not None
+                and len(multi_shapes) > 1
+            )
+
+            if not is_multi_group:
+                assert dtype is not None
+                assert shape is not None
 
             # busy_loop=False prevents spinning on the event loop thread;
             # if staging memory is exhausted the caller will get a logged
             # error rather than a silent deadlock.
-            memory_obj = self.local_cpu_backend.allocate(
-                shape,
-                dtype,
-                fmt,
-                busy_loop=False,
-            )
+            if is_multi_group:
+                memory_obj = self.local_cpu_backend.allocate(
+                    multi_shapes,
+                    multi_dtypes,
+                    fmt,
+                    busy_loop=False,
+                )
+            else:
+                memory_obj = self.local_cpu_backend.allocate(
+                    shape,
+                    dtype,
+                    fmt,
+                    busy_loop=False,
+                )
 
             if memory_obj is None:
                 logger.error(
@@ -649,6 +672,15 @@ class LocalDiskBackend(StorageBackendInterface):
             # elegant way in the future.
             cached_positions = self.dict[key].cached_positions
             mem_obj.metadata.cached_positions = cached_positions
+
+            # MLA fix: restore multi-group shapes/dtypes onto the loaded
+            # MemoryObj so that to_gpu() takes the correct multi-group
+            # transfer path.  For single-group chunks this is a no-op.
+            multi_shapes = getattr(self.dict[key], "_shapes", None)
+            multi_dtypes = getattr(self.dict[key], "_dtypes", None)
+            if multi_shapes is not None and multi_dtypes is not None:
+                mem_obj.metadata.shapes = multi_shapes
+                mem_obj.metadata.dtypes = multi_dtypes
 
             self.disk_lock.acquire()
             self.dict[key].unpin()

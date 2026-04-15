@@ -913,3 +913,130 @@ class TestLocalDiskBackendStartupRecovery:
         )
 
         backend.close()
+
+
+# ----------------------------------------------------------------------------
+# Regression test for batched_get_non_blocking() MLA multi-group fix.
+# "hi" garbled-output bug: async prefetch path was allocating with
+# single-group shape/dtype for MLA multi-group disk chunks, causing
+# to_gpu() to skip the multi-group transfer path and corrupt GPU KV cache.
+# ----------------------------------------------------------------------------
+
+
+class TestBatchedGetNonBlockingMLAMultiGroup:
+    """Regression for the garbled-output bug when a cached MLA chunk is
+    fetched via the async prefetch path (batched_get_non_blocking).
+
+    Root cause: batched_get_non_blocking() did not read _shapes/_dtypes
+    from DiskCacheMetadata, so it allocated a single-group MemoryObj for
+    multi-group MLA chunks. When to_gpu() was later called on that object
+    it skipped the multi-group transfer path and wrote raw bytes into the
+    GPU KV cache using the wrong layout, producing garbled model output.
+
+    The fix mirrors get_blocking(): detect multi-group via _shapes/_dtypes
+    and allocate/restore accordingly.
+    """
+
+    def _put_mla_chunk(self, backend, key):
+        """Write one MLA chunk to disk and wait for completion."""
+        cpu = backend.local_cpu_backend
+        shapes, dtypes = _mla_shapes_and_dtypes()
+        mo = cpu.allocate(
+            shapes, dtypes, fmt=MemoryFormat.KV_MLA_FMT,
+            eviction=False, busy_loop=False,
+        )
+        assert mo is not None, "cpu allocate failed in test setup"
+        backend.submit_put_task(key, mo)
+        _wait_for_put(backend, key)
+        mo.ref_count_down()
+
+    def test_prefetch_returns_multi_group_memory_obj(
+        self, small_local_disk_backend
+    ):
+        """After batched_get_non_blocking(), the returned MemoryObj must
+        have metadata.shapes set (not None), meaning it was allocated as
+        a multi-group object rather than falling back to single-group."""
+        backend = small_local_disk_backend
+
+        # First Party
+        from lmcache.v1.config import LMCacheEngineConfig
+        from lmcache.v1.pin_monitor import PinMonitor
+
+        PinMonitor.GetOrCreate(LMCacheEngineConfig.from_legacy(chunk_size=16))
+
+        key = _make_mla_key(2000)
+        self._put_mla_chunk(backend, key)
+        assert key in backend.dict, "put did not complete"
+
+        # Prefetch via the async path
+        import asyncio as _asyncio
+        coro = backend.batched_get_non_blocking("mla_prefetch_test", [key])
+        fut = _asyncio.run_coroutine_threadsafe(coro, backend.loop)
+        result = fut.result(timeout=5.0)
+
+        assert result is not None and len(result) == 1, (
+            "batched_get_non_blocking should return one MemoryObj"
+        )
+        mo = result[0]
+
+        # The MemoryObj must have metadata.shapes set (multi-group allocation)
+        assert mo.metadata.shapes is not None, (
+            "batched_get_non_blocking returned a single-group MemoryObj for "
+            "a multi-group MLA chunk — metadata.shapes is None, which causes "
+            "to_gpu() to skip multi-group transfer and corrupt the KV cache"
+        )
+        assert len(mo.metadata.shapes) == 2, (
+            f"expected 2 groups in metadata.shapes, got {mo.metadata.shapes}"
+        )
+        assert mo.metadata.dtypes is not None, (
+            "metadata.dtypes must also be restored by batched_async_load_bytes_from_disk"
+        )
+        assert len(mo.metadata.dtypes) == 2
+
+        # Cleanup
+        try:
+            if mo.is_pinned:
+                mo.unpin()
+            mo.ref_count_down()
+        except Exception:
+            pass
+
+    def test_prefetch_shapes_match_original(
+        self, small_local_disk_backend
+    ):
+        """The shapes/dtypes on the prefetched MemoryObj must exactly match
+        what was stored — verifies that metadata restoration is not just
+        setting non-None values but the correct ones."""
+        backend = small_local_disk_backend
+
+        # First Party
+        from lmcache.v1.config import LMCacheEngineConfig
+        from lmcache.v1.pin_monitor import PinMonitor
+
+        PinMonitor.GetOrCreate(LMCacheEngineConfig.from_legacy(chunk_size=16))
+
+        key = _make_mla_key(2001)
+        expected_shapes, expected_dtypes = _mla_shapes_and_dtypes()
+        self._put_mla_chunk(backend, key)
+
+        import asyncio as _asyncio
+        coro = backend.batched_get_non_blocking("mla_shapes_test", [key])
+        fut = _asyncio.run_coroutine_threadsafe(coro, backend.loop)
+        result = fut.result(timeout=5.0)
+
+        assert result and len(result) == 1
+        mo = result[0]
+
+        assert mo.metadata.shapes == expected_shapes, (
+            f"shapes mismatch: got {mo.metadata.shapes}, expected {expected_shapes}"
+        )
+        assert mo.metadata.dtypes == expected_dtypes, (
+            f"dtypes mismatch: got {mo.metadata.dtypes}, expected {expected_dtypes}"
+        )
+
+        try:
+            if mo.is_pinned:
+                mo.unpin()
+            mo.ref_count_down()
+        except Exception:
+            pass
