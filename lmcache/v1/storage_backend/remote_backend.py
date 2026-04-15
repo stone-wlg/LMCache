@@ -71,16 +71,25 @@ class RemoteBackend(StorageBackendInterface):
         )
 
         # Precompute MLA mode status.
-        # `remote_enable_mla_worker_id_as0` controls whether non-zero workers
-        # defer all remote I/O to worker 0 (reads with worker_id=0, skips writes).
+        # `remote_enable_mla_worker_id_as0` controls whether passive workers
+        # (non-first-rank within their PP stage) defer all remote I/O to the
+        # first rank (reads with worker_id=0, skips writes).
         # This is the correct behaviour when save_only_first_rank=True: only
-        # worker 0 stores KV and broadcasts it to TP peers via NCCL.
+        # the first rank of each PP stage stores KV and broadcasts to its TP
+        # peers via NCCL.
         # When save_only_first_rank=False every worker must independently
         # cache its own KV shard, so the mode must be disabled.
         # We therefore default remote_enable_mla_worker_id_as0 to
         # save_only_first_rank (not to use_mla) so that setting
         # save_only_first_rank=False automatically disables this mode without
         # requiring an extra explicit flag.
+        #
+        # IMPORTANT: use `not metadata.is_first_rank()` (PP-stage-aware) rather
+        # than `metadata.worker_id != 0` so that the first TP rank of each PP
+        # stage (e.g., global rank 8 in a TP=8 PP=2 deployment) is treated as
+        # an active writer, not a passive receiver.  With `worker_id != 0` the
+        # PP-stage-1 first rank would silently skip all FS writes and read
+        # stale PP-stage-0 data on restart.
         _save_only_first_rank = config.get_extra_config_value(
             "save_only_first_rank", metadata.use_mla
         )
@@ -90,7 +99,7 @@ class RemoteBackend(StorageBackendInterface):
             )
             and metadata.use_mla
             and metadata.world_size > 1
-            and metadata.worker_id != 0
+            and not metadata.is_first_rank()
         )
         logger.info(f"metadata={metadata}")
         logger.info(

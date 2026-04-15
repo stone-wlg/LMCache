@@ -5,7 +5,7 @@ Background — GLM-5.1 requires 16 H100 GPUs, typically deployed as
 TP=8 PP=2 or TP=4 PP=4.  The save_only_first_rank MLA optimisation
 previously treated global rank 0 as the sole "first rank", causing
 all PP stages beyond stage-0 to behave as passive receivers and never
-store their (different) KV layers.  The fix:
+store their (different) KV layers.  The fixes:
   - LMCacheMetadata.is_first_rank() is now PP-stage-aware when tp_size>1:
       returns True for every worker where global_rank % tp_size == 0,
       i.e. tp_rank == 0 within each PP stage.
@@ -14,11 +14,16 @@ store their (different) KV layers.  The fix:
     gets a unique, stable cache key.
   - The broadcast sender now uses local_worker_id (local GPU device index)
     instead of the global rank to avoid OOB device indices on multi-node.
+  - RemoteBackend._mla_worker_id_as0_mode now uses `not is_first_rank()`
+    instead of `worker_id != 0` so that the first TP rank of each PP stage
+    (e.g., global rank 8 in TP=8 PP=2) correctly stores its KV layers to
+    the FS backend rather than silently dropping all writes.
 """
 
 # Standard
 import torch
 import pytest
+from unittest import mock
 
 # First Party
 from lmcache.v1.metadata import LMCacheMetadata
@@ -207,3 +212,92 @@ class TestIsPassivePPBehaviour:
             assert self._make_engine_like_passive_check(r, 16, 8), f"rank {r} should be passive"
         for r in [9, 10, 11, 12, 13, 14, 15]:
             assert self._make_engine_like_passive_check(r, 16, 8), f"rank {r} should be passive"
+
+
+class TestRemoteBackendMlaWorkerIdAs0ModePP:
+    """RemoteBackend._mla_worker_id_as0_mode must use is_first_rank() (PP-aware)
+    rather than worker_id != 0, so that the first TP rank of each PP stage
+    (e.g., global rank 8 in TP=8 PP=2) is treated as an active writer.
+
+    Regression test for: PP-stage-1 first rank silently skipping all FS writes
+    and reading stale PP-stage-0 data on vLLM restart.
+    """
+
+    def _make_backend_mla_mode(
+        self,
+        global_rank: int,
+        world_size: int,
+        tp_size: int,
+        save_only_first_rank: bool = True,
+    ) -> bool:
+        """Return _mla_worker_id_as0_mode for the given rank config."""
+        import asyncio
+        import threading
+        from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+        from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+        from lmcache.v1.memory_management import AdHocMemoryAllocator
+
+        config = LMCacheEngineConfig(
+            chunk_size=16,
+            local_cpu=True,
+            max_local_cpu_size=1.0,
+            local_disk=None,
+            max_local_disk_size=0.0,
+            remote_url="lm://localhost:65432",
+            remote_serde="naive",
+            use_layerwise=False,
+            save_decode_cache=False,
+            enable_blending=False,
+            extra_config={"save_only_first_rank": save_only_first_rank},
+        )
+        meta = _make_metadata(global_rank, world_size, tp_size, pp_size=world_size // tp_size)
+        allocator = AdHocMemoryAllocator()
+        cpu_backend = LocalCPUBackend(config, meta, memory_allocator=allocator)
+        loop = asyncio.new_event_loop()
+
+        with mock.patch("torch.cuda.Stream"):
+            backend = RemoteBackend(config=config, metadata=meta, loop=loop,
+                                    local_cpu_backend=cpu_backend)
+
+        mode = backend._mla_worker_id_as0_mode
+        loop.close()
+        return mode
+
+    def test_tp8_pp2_rank0_not_in_mla_mode(self):
+        """Global rank 0 (PP0 first rank) must NOT be in _mla_worker_id_as0_mode."""
+        assert not self._make_backend_mla_mode(0, 16, 8), (
+            "rank 0 (PP0 first rank) should never be in _mla_worker_id_as0_mode"
+        )
+
+    def test_tp8_pp2_rank8_not_in_mla_mode(self):
+        """Global rank 8 (PP1 first rank, TP8 PP2) must NOT be in _mla_worker_id_as0_mode.
+
+        This is the key regression: with worker_id!=0, rank 8 was incorrectly
+        placed in _mla_worker_id_as0_mode, silently dropping all its FS writes
+        and causing garbled output after vLLM restart.
+        """
+        assert not self._make_backend_mla_mode(8, 16, 8), (
+            "rank 8 (PP1 first rank) must NOT be in _mla_worker_id_as0_mode — "
+            "it needs to independently store its PP-stage-1 KV layers"
+        )
+
+    def test_tp8_pp2_passive_ranks_are_in_mla_mode(self):
+        """Non-first-rank workers in each PP stage are passive and use _mla_worker_id_as0_mode."""
+        for r in [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15]:
+            assert self._make_backend_mla_mode(r, 16, 8), (
+                f"rank {r} (passive worker) should be in _mla_worker_id_as0_mode"
+            )
+
+    def test_tp4_pp4_first_ranks_not_in_mla_mode(self):
+        """TP=4 PP=4 (16 total): ranks 0,4,8,12 (first rank of each PP stage) must NOT be in mode."""
+        for r in [0, 4, 8, 12]:
+            assert not self._make_backend_mla_mode(r, 16, 4), (
+                f"rank {r} (PP first rank) must NOT be in _mla_worker_id_as0_mode"
+            )
+
+    def test_save_only_first_rank_false_disables_mode_for_all(self):
+        """save_only_first_rank=False: no worker should be in _mla_worker_id_as0_mode."""
+        for r in range(8):
+            assert not self._make_backend_mla_mode(r, 8, 4, save_only_first_rank=False), (
+                f"rank {r}: save_only_first_rank=False must disable _mla_worker_id_as0_mode"
+            )
