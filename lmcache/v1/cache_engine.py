@@ -529,19 +529,37 @@ class LMCacheEngine:
         if not memory_objs:
             return
 
-        with store_stats.profile_from_gpu():
-            self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+        try:
+            with store_stats.profile_from_gpu():
+                self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
 
-        with store_stats.profile_put():
-            transfer_spec = kwargs.get("transfer_spec", None)
-            # TODO: we implicitly rely on batched_put to call ref_count_down
-            # this management should be done in a cleaner way
-            self.storage_manager.batched_put(
-                keys,
-                memory_objs,
-                transfer_spec=transfer_spec,
-                location=self.store_location,
+            with store_stats.profile_put():
+                transfer_spec = kwargs.get("transfer_spec", None)
+                # TODO: we implicitly rely on batched_put to call ref_count_down
+                # this management should be done in a cleaner way
+                self.storage_manager.batched_put(
+                    keys,
+                    memory_objs,
+                    transfer_spec=transfer_spec,
+                    location=self.store_location,
+                )
+        except Exception as e:
+            # Release any pinned memory objects to prevent pin deadlock.
+            # Without this, a failed from_gpu or batched_put leaves pins held,
+            # blocking the vLLM scheduler from reusing GPU KV blocks.
+            logger.error(
+                "[req_id=%s] Store failed during from_gpu/put, "
+                "releasing %d memory objects to prevent pin deadlock: %s",
+                req_id, len(memory_objs), e,
             )
+            for mo in memory_objs:
+                try:
+                    if mo.is_pinned:
+                        mo.unpin()
+                    mo.ref_count_down()
+                except Exception:
+                    pass
+            return
 
         self.stats_monitor.on_store_finished(
             store_stats,
@@ -1096,6 +1114,17 @@ class LMCacheEngine:
             return 0
 
         assert self.storage_manager is not None
+
+        # MLA save_only_first_rank lookup fix: non-first ranks have empty
+        # storage when save_only_first_rank is enabled. Return total
+        # requested tokens so min() aggregation in the lookup client
+        # defers to rank 0's result (which has the actual stored data).
+        if self.save_only_first_rank and not self.metadata.is_first_rank():
+            total = (
+                len(tokens) if tokens is not None
+                else (sum(offsets) if offsets else 0)
+            )
+            return total
 
         if tokens is not None:
             lookup_stats = self.stats_monitor.on_lookup_request(len(tokens))

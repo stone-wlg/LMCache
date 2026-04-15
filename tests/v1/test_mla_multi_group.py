@@ -1,0 +1,230 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for MLA multi-group KV cache support.
+
+MLA (Multi-Latent Attention) models like GLM-5 and DeepSeek V3 store KV cache
+as two separate groups with different dtypes:
+  - Group 0: K_rope (e.g., 78 layers, uint8/FP8, head_dim=132)
+  - Group 1: Latent KV (e.g., 78 layers, bfloat16, head_dim=576)
+
+These tests verify that LMCache correctly handles multi-group allocation,
+tensor access, and pointer initialization without crashing.
+
+Related issues: #2774, #2881
+"""
+
+# Third Party
+import pytest
+import torch
+
+# First Party
+from lmcache.v1.memory_management import (
+    AdHocMemoryAllocator,
+    MemoryFormat,
+    TensorMemoryObj,
+    get_size_bytes,
+)
+
+
+# -- Helpers ------------------------------------------------------------------
+
+
+def _mla_shapes_and_dtypes(
+    num_layers: int = 78,
+    chunk_size: int = 256,
+    k_rope_dim: int = 132,
+    latent_dim: int = 576,
+) -> tuple[list[torch.Size], list[torch.dtype]]:
+    """Return (shapes, dtypes) mimicking a two-group MLA KV cache.
+
+    Group 0: K_rope  — [1, num_layers, chunk_size, k_rope_dim], uint8
+    Group 1: Latent  — [1, num_layers, chunk_size, latent_dim], bfloat16
+    """
+    shapes = [
+        torch.Size([1, num_layers, chunk_size, k_rope_dim]),
+        torch.Size([1, num_layers, chunk_size, latent_dim]),
+    ]
+    dtypes = [torch.uint8, torch.bfloat16]
+    return shapes, dtypes
+
+
+def _allocate_mla_memory_obj(
+    num_layers: int = 78,
+    chunk_size: int = 256,
+    k_rope_dim: int = 132,
+    latent_dim: int = 576,
+    device: str = "cpu",
+) -> TensorMemoryObj:
+    """Allocate a TensorMemoryObj with two-group MLA layout."""
+    shapes, dtypes = _mla_shapes_and_dtypes(
+        num_layers, chunk_size, k_rope_dim, latent_dim
+    )
+    allocator = AdHocMemoryAllocator(device=device)
+    memory_obj = allocator.allocate(shapes, dtypes, fmt=MemoryFormat.KV_MLA_FMT)
+    assert memory_obj is not None
+    return memory_obj
+
+
+# -- Tests: memory_management.py ----------------------------------------------
+
+
+class TestMLAMultiGroupTensorAccess:
+    """Verify TensorMemoryObj handles multi-group shapes correctly."""
+
+    def test_tensor_raises_for_multi_group(self) -> None:
+        """The .tensor property must raise ValueError for multi-group objects.
+
+        Multi-group memory objects cannot be reshaped into a single tensor
+        because groups have different dtypes.  Callers should use
+        get_tensor(group_index) instead.
+        """
+        obj = _allocate_mla_memory_obj()
+        with pytest.raises(ValueError, match="multi-group"):
+            _ = obj.tensor
+
+    def test_raw_tensor_available_for_multi_group(self) -> None:
+        """raw_tensor returns the underlying flat buffer even for multi-group."""
+        obj = _allocate_mla_memory_obj()
+        raw = obj.raw_tensor
+        assert raw is not None
+        assert raw.dtype == torch.uint8
+
+    def test_tensor_returns_shaped_for_single_group(self) -> None:
+        """Single-group (non-MLA) still returns a shaped tensor."""
+        shapes = [torch.Size([2, 32, 256, 128])]
+        dtypes = [torch.bfloat16]
+        allocator = AdHocMemoryAllocator(device="cpu")
+        obj = allocator.allocate(shapes, dtypes, fmt=MemoryFormat.KV_2LTD)
+        assert obj is not None
+        tensor = obj.tensor
+        assert tensor is not None
+        assert tensor.shape == torch.Size([2, 32, 256, 128])
+        assert tensor.dtype == torch.bfloat16
+
+    def test_get_tensor_per_group(self) -> None:
+        """get_tensor(index) returns correctly shaped per-group views."""
+        num_layers = 78
+        chunk_size = 256
+        k_rope_dim = 132
+        latent_dim = 576
+
+        obj = _allocate_mla_memory_obj(
+            num_layers=num_layers,
+            chunk_size=chunk_size,
+            k_rope_dim=k_rope_dim,
+            latent_dim=latent_dim,
+        )
+
+        group0 = obj.get_tensor(0)
+        assert group0 is not None
+        assert group0.shape == torch.Size([1, num_layers, chunk_size, k_rope_dim])
+        assert group0.dtype == torch.uint8
+
+        group1 = obj.get_tensor(1)
+        assert group1 is not None
+        assert group1.shape == torch.Size([1, num_layers, chunk_size, latent_dim])
+        assert group1.dtype == torch.bfloat16
+
+    def test_raw_buffer_size_equals_sum_of_groups(self) -> None:
+        """The raw buffer should be exactly large enough for both groups."""
+        num_layers = 78
+        chunk_size = 256
+        k_rope_dim = 132
+        latent_dim = 576
+
+        shapes, dtypes = _mla_shapes_and_dtypes(
+            num_layers, chunk_size, k_rope_dim, latent_dim
+        )
+        expected_size = get_size_bytes(shapes, dtypes)
+
+        obj = _allocate_mla_memory_obj(
+            num_layers=num_layers,
+            chunk_size=chunk_size,
+            k_rope_dim=k_rope_dim,
+            latent_dim=latent_dim,
+        )
+        assert obj.get_size() == expected_size
+
+    def test_group_views_do_not_overlap(self) -> None:
+        """Per-group tensor views should reference non-overlapping memory."""
+        obj = _allocate_mla_memory_obj()
+
+        group0 = obj.get_tensor(0)
+        group1 = obj.get_tensor(1)
+        assert group0 is not None
+        assert group1 is not None
+
+        # Write distinct values into each group
+        group0.fill_(42)
+        group1.fill_(0)
+
+        # Verify group0 data wasn't overwritten
+        assert group0.flatten()[0].item() == 42
+
+
+# NOTE: The _initialize_pointers multi-group expansion and the
+# from_gpu / to_gpu multi-group paths are tested end-to-end by the
+# full inference integration tests that exercise MLA models.  Unit
+# testing those paths in isolation would require mocking the CUDA
+# kernel (lmc_ops.multi_layer_kv_transfer) which is fragile and
+# provides low signal.  See the integration test suite for coverage.
+
+
+class TestMLASaveOnlyFirstRankLookup:
+    """Verify lookup returns total tokens for non-first ranks when
+    save_only_first_rank is enabled, so min() aggregation defers to rank 0."""
+
+    def test_non_first_rank_lookup_returns_total_tokens(self) -> None:
+        """Non-first ranks must return total tokens to avoid zeroing
+        the min() aggregation in the lookup client."""
+        # Skip if CUDA is not available
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        # First Party
+        from lmcache.v1.cache_engine import LMCacheEngineBuilder
+        from lmcache.v1.config import LMCacheEngineConfig
+        from lmcache.v1.metadata import LMCacheMetadata
+
+        # Create metadata for a non-first rank MLA model
+        metadata = LMCacheMetadata(
+            model_name="test_mla_model",
+            world_size=8,
+            local_world_size=8,
+            worker_id=3,  # NOT first rank
+            local_worker_id=3,
+            kv_dtype=torch.bfloat16,
+            kv_shape=(78, 1, 256, 1, 576),
+            use_mla=True,
+            role="worker",
+        )
+
+        config = LMCacheEngineConfig(
+            local_cpu=True,
+            max_local_cpu_size=1.0,
+            chunk_size=256,
+        )
+
+        engine = LMCacheEngineBuilder.build(
+            config=config,
+            metadata=metadata,
+        )
+
+        # Lookup with token_ids
+        token_ids = list(range(512))
+        result = engine.lookup(tokens=token_ids)
+
+        # Non-first rank should return total tokens (512)
+        assert result == len(token_ids), (
+            f"Non-first rank lookup should return {len(token_ids)}, "
+            f"got {result}"
+        )
+
+        # Lookup with hashes/offsets
+        result_hashes = engine.lookup(
+            hashes=[123, 456],
+            offsets=[256, 256],
+        )
+        assert result_hashes == 512, (
+            f"Non-first rank lookup with offsets should return 512, "
+            f"got {result_hashes}"
+        )

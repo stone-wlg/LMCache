@@ -170,6 +170,31 @@ class LocalDiskBackend(StorageBackendInterface):
         self.max_cache_size = int(config.max_local_disk_size * 1024**3)
         self.current_cache_size = 0.0
 
+        # Clean up leftover cache files from previous container lifecycle.
+        # Without this, current_cache_size=0 doesn't match the actual on-disk
+        # footprint, causing eviction to fire late and disk to exceed
+        # max_cache_size. See neuralwatt/inference_frontend#1900
+        # (startup-state-recovery bug).
+        import glob
+        leftover_pattern = os.path.join(self.path, "*.pt")
+        leftovers = glob.glob(leftover_pattern)
+        if leftovers:
+            leftover_bytes = sum(os.path.getsize(f) for f in leftovers)
+            logger.info(
+                "Cleaning up %d leftover cache files from %s (%.3f GiB) "
+                "to prevent eviction-accounting drift",
+                len(leftovers),
+                self.path,
+                leftover_bytes / (1024**3),
+            )
+            for f in leftovers:
+                try:
+                    os.remove(f)
+                except OSError as e:
+                    logger.warning(
+                        "Failed to remove leftover cache file %s: %s", f, e
+                    )
+
         # to help maintain suffix -> prefix order in the dict
         # assumption: only one request is looked up at a time
         # (only one worker per cache engine)
@@ -293,6 +318,8 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype: torch.dtype,
         fmt: MemoryFormat,
         cached_positions: Optional[torch.Tensor] = None,
+        shapes: Optional[list] = None,
+        dtypes: Optional[list] = None,
     ) -> None:
         path = self._key_to_path(key)
 
@@ -303,9 +330,13 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.cache_policy.update_on_hit(key, self.dict)
                 has_stored = True
             else:
-                self.dict[key] = DiskCacheMetadata(
+                meta = DiskCacheMetadata(
                     path, size, shape, dtype, cached_positions, fmt, 0
                 )
+                # MLA fix: attach multi-group metadata
+                meta._shapes = shapes
+                meta._dtypes = dtypes
+                self.dict[key] = meta
 
         # Push kv admit msg with batching
         if self.batched_msg_sender is not None and not has_stored:
@@ -329,7 +360,7 @@ class LocalDiskBackend(StorageBackendInterface):
             after the disk write completes. Callback exceptions are caught
             and logged.
         """
-        assert memory_obj.tensor is not None
+        assert memory_obj.raw_tensor is not None
 
         # skip repeated save
         if self.exists_in_put_tasks(key):
@@ -339,7 +370,10 @@ class LocalDiskBackend(StorageBackendInterface):
         self.disk_worker.insert_put_task(key)
 
         # TODO(Jiayi): Fragmentation is not considered here.
-        required_size = memory_obj.get_physical_size()
+        # #1900: use len(byte_array), not get_physical_size(), so multi-group
+        # MLA objects account against the true on-disk byte count (phy_size
+        # is 4096-aligned or zero for the AdHoc allocator path).
+        required_size = len(memory_obj.byte_array)
         all_evict_keys = []
         evict_success = True
         with self.disk_lock:
@@ -427,9 +461,20 @@ class LocalDiskBackend(StorageBackendInterface):
         assert shape is not None
 
         self.disk_lock.release()
-        memory_obj = self.load_bytes_from_disk(
-            key, path, dtype=dtype, shape=shape, fmt=fmt
-        )
+        # MLA fix: use multi-group shapes/dtypes if available
+        shapes = getattr(disk_meta, "_shapes", None)
+        dtypes_list = getattr(disk_meta, "_dtypes", None)
+        if shapes is not None and dtypes_list is not None and len(shapes) > 1:
+            memory_obj = self.local_cpu_backend.allocate(shapes, dtypes_list, fmt)
+            assert memory_obj is not None
+            buffer = memory_obj.byte_array
+            self.read_file(key, buffer, path)
+            cached_positions = disk_meta.cached_positions
+            memory_obj.metadata.cached_positions = cached_positions
+        else:
+            memory_obj = self.load_bytes_from_disk(
+                key, path, dtype=dtype, shape=shape, fmt=fmt
+            )
 
         return memory_obj
 
@@ -441,6 +486,7 @@ class LocalDiskBackend(StorageBackendInterface):
     ) -> list[MemoryObj]:
         mem_objs: list[MemoryObj] = []
         paths: list[str] = []
+        pinned_disk_keys: list[CacheEngineKey] = []
 
         logger.debug(f"lookup_id: {lookup_id}; Prefetching {len(keys)} keys from disk.")
         for key in keys:
@@ -469,12 +515,26 @@ class LocalDiskBackend(StorageBackendInterface):
                 logger.error(
                     "Memory allocation failed during async disk load for key %s. "
                     "CPU staging pool may be exhausted (unpin() not called after "
-                    "a previous retrieve). Returning partial results.",
+                    "a previous retrieve). Unpinning %d previously pinned disk "
+                    "keys and returning partial results.",
                     key,
+                    len(pinned_disk_keys),
                 )
-                return mem_objs
+                # Unpin all disk entries we pinned in this batch to prevent
+                # pin deadlock — without this, pinned objects hold CPU memory
+                # references that can never be freed, eventually exhausting
+                # the CPU staging pool and hanging the engine.
+                for pinned_key in pinned_disk_keys:
+                    if pinned_key in self.dict:
+                        self.dict[pinned_key].unpin()
+                for mo in mem_objs:
+                    if mo.is_pinned:
+                        mo.unpin()
+                self.disk_lock.release()
+                return []
 
             self.dict[key].pin()
+            pinned_disk_keys.append(key)
 
             # NOTE(Jiayi): Currently, we consider prefetch as cache hit.
             # Update cache recency
@@ -526,7 +586,7 @@ class LocalDiskBackend(StorageBackendInterface):
             write completes for this key. Callback exceptions are caught and
             logged.
         """
-        kv_chunk = memory_obj.tensor
+        kv_chunk = memory_obj.raw_tensor  # MLA fix
         assert kv_chunk is not None
         buffer = memory_obj.byte_array
         path = self._key_to_path(key)
@@ -544,14 +604,20 @@ class LocalDiskBackend(StorageBackendInterface):
         # purposes (e.g., testing mem_leak).
         # TODO(Jiayi): This could be problematic if the
         # freed memory object is immediately reused.
-        size = memory_obj.get_physical_size()
+        # #1900: record the actual on-disk bytes written (== len(buffer))
+        # so meta.size matches the file size for multi-group MLA objects.
+        size = len(buffer)
         shape = memory_obj.metadata.shape
         dtype = memory_obj.metadata.dtype
         fmt = memory_obj.metadata.fmt
         cached_positions = memory_obj.metadata.cached_positions
+        # MLA fix: preserve multi-group shapes/dtypes
+        shapes = memory_obj.metadata.shapes
+        dtypes = memory_obj.metadata.dtypes
         memory_obj.ref_count_down()
 
-        self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions)
+        self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions,
+            shapes=shapes, dtypes=dtypes)
 
         self.disk_worker.remove_put_task(key)
 
